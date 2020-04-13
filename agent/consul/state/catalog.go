@@ -776,7 +776,7 @@ func (s *Store) ensureServiceTxn(tx *memdb.Txn, idx uint64, node string, svc *st
 	}
 
 	// Check if this service is covered by a terminating gateway's wildcard specifier
-	gateway, err := s.serviceTerminatingGateway(tx, structs.WildcardSpecifier, &svc.EnterpriseMeta)
+	_, gateway, err := s.serviceTerminatingGateway(tx, structs.WildcardSpecifier, &svc.EnterpriseMeta)
 	if err != nil {
 		return fmt.Errorf("failed gateway lookup for %q: %s", svc.Service, err)
 	}
@@ -1044,7 +1044,7 @@ func (s *Store) serviceNodes(ws memdb.WatchSet, serviceName string, connect bool
 	// to the mesh with a mix of sidecars and gateways until all its instances have a sidecar.
 	if connect {
 		// Look up gateway nodes associated with the service
-		nodes, ch, err := s.serviceTerminatingGatewayNodes(tx, serviceName, entMeta)
+		nodes, ch, err := s.serviceTerminatingGatewayNodes(tx, ws, serviceName, entMeta)
 		if err != nil {
 			return 0, nil, fmt.Errorf("failed gateway nodes lookup: %v", err)
 		}
@@ -1464,7 +1464,7 @@ func (s *Store) deleteServiceTxn(tx *memdb.Txn, idx uint64, nodeName, serviceID 
 			}
 
 			// Clean up association between service name and gateway
-			gateway, err := s.serviceTerminatingGateway(tx, svc.ServiceName, &svc.EnterpriseMeta)
+			_, gateway, err := s.serviceTerminatingGateway(tx, svc.ServiceName, &svc.EnterpriseMeta)
 			if err != nil {
 				return fmt.Errorf("failed gateway lookup for %q: %s", svc.ServiceName, err)
 			}
@@ -1991,9 +1991,11 @@ func (s *Store) checkServiceNodesTxn(tx *memdb.Txn, ws memdb.WatchSet, serviceNa
 	// Gateways are tracked in a separate table, and we append them to the result set.
 	// We append rather than replace since it allows users to migrate a service
 	// to the mesh with a mix of sidecars and gateways until all its instances have a sidecar.
+	var gatewayChan <-chan struct{}
 	if connect {
 		// Look up gateway nodes associated with the service
-		nodes, _, err := s.serviceTerminatingGatewayNodes(tx, serviceName, entMeta)
+		var nodes structs.ServiceNodes
+		nodes, gatewayChan, err = s.serviceTerminatingGatewayNodes(tx, ws, serviceName, entMeta)
 		if err != nil {
 			return 0, nil, fmt.Errorf("failed gateway nodes lookup: %v", err)
 		}
@@ -2060,6 +2062,7 @@ func (s *Store) checkServiceNodesTxn(tx *memdb.Txn, ws memdb.WatchSet, serviceNa
 		fallbackWS = ws
 		// We also need to watch the iterator from earlier too.
 		fallbackWS.Add(iter.WatchCh())
+		fallbackWS.Add(gatewayChan)
 	} else if connect {
 		// If this is a connect query then there is a subtlety to watch out for.
 		// In addition to watching the proxy service indexes for changes above, we
@@ -2495,7 +2498,7 @@ func (s *Store) updateTerminatingGatewayServices(tx *memdb.Txn, idx uint64, conf
 		}
 
 		// Check if the non-wildcard service is already associated with a gateway
-		existing, err := s.serviceTerminatingGateway(tx, svc.Name, &svc.EnterpriseMeta)
+		_, existing, err := s.serviceTerminatingGateway(tx, svc.Name, &svc.EnterpriseMeta)
 		if err != nil {
 			return fmt.Errorf("gateway service lookup failed: %s", err)
 		}
@@ -2546,7 +2549,7 @@ func (s *Store) updateTerminatingGatewayNamespace(tx *memdb.Txn, gateway structs
 			continue
 		}
 
-		existing, err := s.serviceTerminatingGateway(tx, sn.ServiceName, &sn.EnterpriseMeta)
+		_, existing, err := s.serviceTerminatingGateway(tx, sn.ServiceName, &sn.EnterpriseMeta)
 		if err != nil {
 			return fmt.Errorf("gateway service lookup failed: %s", err)
 		}
@@ -2601,7 +2604,7 @@ func (s *Store) updateTerminatingGatewayService(tx *memdb.Txn, idx uint64, gatew
 	}
 
 	// If a wildcard specifier is registered for that namespace, use its TLS config
-	wc, err := s.serviceTerminatingGateway(tx, structs.WildcardSpecifier, entMeta)
+	_, wc, err := s.serviceTerminatingGateway(tx, structs.WildcardSpecifier, entMeta)
 	if err != nil {
 		return fmt.Errorf("gateway service lookup failed: %s", err)
 	}
@@ -2614,7 +2617,7 @@ func (s *Store) updateTerminatingGatewayService(tx *memdb.Txn, idx uint64, gatew
 
 	// Check if mapping already exists in table if it's already in the table
 	// Avoid insert if nothing changed
-	existing, err := s.serviceTerminatingGateway(tx, service, entMeta)
+	_, existing, err := s.serviceTerminatingGateway(tx, service, entMeta)
 	if err != nil {
 		return fmt.Errorf("gateway service lookup failed: %s", err)
 	}
@@ -2634,27 +2637,29 @@ func (s *Store) updateTerminatingGatewayService(tx *memdb.Txn, idx uint64, gatew
 	return nil
 }
 
-func (s *Store) serviceTerminatingGateway(tx *memdb.Txn, name string, entMeta *structs.EnterpriseMeta) (interface{}, error) {
-	return tx.First(terminatingGatewayServicesTableName, "service", structs.NewServiceID(name, entMeta))
+func (s *Store) serviceTerminatingGateway(tx *memdb.Txn, name string, entMeta *structs.EnterpriseMeta) (<-chan struct{}, interface{}, error) {
+	return tx.FirstWatch(terminatingGatewayServicesTableName, "service", structs.NewServiceID(name, entMeta))
 }
 
 func (s *Store) terminatingGatewayServices(tx *memdb.Txn, name string, entMeta *structs.EnterpriseMeta) (memdb.ResultIterator, error) {
 	return tx.Get(terminatingGatewayServicesTableName, "gateway", structs.NewServiceID(name, entMeta))
 }
 
-func (s *Store) serviceTerminatingGatewayNodes(tx *memdb.Txn, service string, entMeta *structs.EnterpriseMeta) (structs.ServiceNodes, <-chan struct{}, error) {
+func (s *Store) serviceTerminatingGatewayNodes(tx *memdb.Txn, ws memdb.WatchSet, service string, entMeta *structs.EnterpriseMeta) (structs.ServiceNodes, <-chan struct{}, error) {
 	// Look up gateway name associated with the service
-	gw, err := s.serviceTerminatingGateway(tx, service, entMeta)
+	ch, gw, err := s.serviceTerminatingGateway(tx, service, entMeta)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed gateway lookup: %s", err)
 	}
+	// Adding this channel to the WatchSet means that the watch will fire if a config entry targeting the service is added.
+	// Otherwise, if there's no associated gateway, then no watch channel would be returned and only Connect proxies
+	// in the "services" table would be watched.
+	ws.Add(ch)
 
 	var ret structs.ServiceNodes
 	var watchChan <-chan struct{}
 
-	if gw != nil {
-		mapping := gw.(*structs.GatewayService)
-
+	if mapping, ok := gw.(*structs.GatewayService); ok {
 		// Look up nodes for gateway
 		gateways, err := s.catalogServiceNodeList(tx, mapping.Gateway.ID, "service", &mapping.Gateway.EnterpriseMeta)
 		if err != nil {
