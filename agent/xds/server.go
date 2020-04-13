@@ -262,12 +262,11 @@ func (s *Server) process(stream ADSStream, reqCh <-chan *envoy.DiscoveryRequest)
 			if rule != nil && rule.ServiceWrite(cfgSnap.Proxy.DestinationServiceName, &authzContext) != acl.Allow {
 				return status.Errorf(codes.PermissionDenied, "permission denied")
 			}
-		case structs.ServiceKindMeshGateway:
-			cfgSnap.ProxyID.EnterpriseMeta.FillAuthzContext(&authzContext)
-			if rule != nil && rule.ServiceWrite(cfgSnap.Service, &authzContext) != acl.Allow {
-				return status.Errorf(codes.PermissionDenied, "permission denied")
-			}
 		// TODO(cpiraino): Test this somehow?
+		case structs.ServiceKindMeshGateway:
+			fallthrough
+		case structs.ServiceKindTerminatingGateway:
+			fallthrough
 		case structs.ServiceKindIngressGateway:
 			cfgSnap.ProxyID.EnterpriseMeta.FillAuthzContext(&authzContext)
 			if rule != nil && rule.ServiceWrite(cfgSnap.Service, &authzContext) != acl.Allow {
